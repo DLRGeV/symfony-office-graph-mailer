@@ -10,6 +10,9 @@ use Symfony\Component\Mailer\SentMessage;
 use Symfony\Component\Mailer\Transport\AbstractApiTransport;
 use Symfony\Component\Mime\Address;
 use Symfony\Component\Mime\Email;
+use Symfony\Component\Mime\Header\Headers;
+use Symfony\Component\Mime\Header\ParameterizedHeader;
+use Symfony\Component\Mime\Part\DataPart;
 use Symfony\Contracts\HttpClient\Exception\TransportExceptionInterface;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
 use Symfony\Contracts\HttpClient\ResponseInterface;
@@ -147,9 +150,9 @@ class GraphApiTransport extends AbstractApiTransport
                 'contentBytes' => base64_encode($attachment->getBody()),
                 'name' => $filename,
             ];
-            if ($attachment->getDisposition() === 'inline') {
+            if ($this->isInlineAttachment($attachment, $headers)) {
                 $normalizedAttachment['isInline'] = true;
-                $normalizedAttachment['contentId'] = $attachment->getName();
+//                $normalizedAttachment['contentId'] = $attachment->getName();
             }
             $attachments[] = $normalizedAttachment;
         }
@@ -168,6 +171,21 @@ class GraphApiTransport extends AbstractApiTransport
         }
 
         return $saveToSentItems;
+    }
+
+    private function isInlineAttachment(DataPart $attachment, Headers $headers): bool
+    {
+        if(method_exists($attachment, 'getDisposition')) {
+            return $attachment->getDisposition() === 'inline';
+        }
+
+        $ContentDispositionHeader = $headers->get('Content-Disposition');
+
+        if($ContentDispositionHeader instanceof ParameterizedHeader) {
+            return $ContentDispositionHeader->getValue() === 'inline';
+        }
+
+        return false;
     }
 
     private function requestAccessToken(): void
