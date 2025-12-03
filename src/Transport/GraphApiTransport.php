@@ -22,20 +22,21 @@ use Symfony\Contracts\HttpClient\ResponseInterface;
  */
 class GraphApiTransport extends AbstractApiTransport
 {
-    private string $graphTentantId;
+    private static $accessTokenCache = [];
+
+    private string $graphTenantId;
     private string $graphClientId;
     private string $graphClientSecret;
-    private ?string $accessToken = null;
 
     public function __construct(
-        string $graphTentantId,
+        string $graphTenantId,
         string $graphClientId,
         string $graphClientSecret,
         ?HttpClientInterface $client = null,
         ?EventDispatcherInterface $dispatcher = null,
         ?LoggerInterface $logger = null
     ) {
-        $this->graphTentantId = $graphTentantId;
+        $this->graphTenantId = $graphTenantId;
         $this->graphClientId = $graphClientId;
         $this->graphClientSecret = $graphClientSecret;
 
@@ -44,24 +45,24 @@ class GraphApiTransport extends AbstractApiTransport
 
     public function __toString(): string
     {
-        return sprintf('microsoft-graph-api://%s:{SECRET}@%s', $this->graphClientId, $this->graphTentantId);
+        return sprintf('microsoft-graph-api://%s:{SECRET}@%s', $this->graphClientId, $this->graphTenantId);
     }
 
     protected function doSendApi(SentMessage $sentMessage, Email $email, Envelope $envelope): ResponseInterface
     {
-        if (null === $this->accessToken) {
-            $this->requestAccessToken();
-        }
+        $bodyStream = $this->convertToBase64Stream($email);
 
         $response = $this->client->request('POST', $this->getEndpoint($sentMessage), [
-            'json' => $this->normalizeEmail($email, $envelope),
-            'auth_bearer' => $this->accessToken,
+            'body' => $bodyStream,
+            'auth_bearer' => $this->getAccessToken(),
         ]);
 
         try {
             $statusCode = $response->getStatusCode();
         } catch (TransportExceptionInterface $e) {
             throw new HttpTransportException('Could not reach Microsoft Graph API.', $response, 0, $e);
+        } finally {
+            fclose($bodyStream);
         }
 
         if (202 !== $statusCode) {
@@ -71,126 +72,40 @@ class GraphApiTransport extends AbstractApiTransport
         return $response;
     }
 
-    private function normalizeEmail(Email $email, Envelope $envelope): array
-    {
-        $payload = [
-            'message' => [
-                'subject' => $email->getSubject(),
-                'toRecipients' => $this->normalizeAddresses($envelope->getRecipients() ?? $email->getTo()),
-                'ccRecipients' => $this->normalizeAddresses($envelope->getRecipients() ? [] : $email->getCc()),
-                'bccRecipients' => $this->normalizeAddresses($envelope->getRecipients() ? [] : $email->getBcc()),
-                'replyTo' => $this->normalizeAddresses($email->getReplyTo()),
-                'body' => $this->normalizeBody($email),
-                'attachments' => $this->normalizeAttachments($email),
-            ],
-            'saveToSentItems' => $this->normalizeSaveToSentItems($email),
-        ];
-
-        return $payload;
-    }
-
-    private function normalizeAddress(Address $address): array
-    {
-        $addressArray = [
-            'emailAddress' => [
-                'address' => $address->getAddress(),
-            ],
-        ];
-        if ($address->getName()) {
-            $addressArray['emailAddress']['name'] = $address->getName();
-        }
-
-        return $addressArray;
-    }
-
     /**
-     * @param Address[] $addresses
+     * @return resource
      */
-    private function normalizeAddresses(array $addresses): array
+    private function convertToBase64Stream(Email $email)
     {
-        $addressesArray = [];
-        foreach ($addresses as $address) {
-            $addressesArray[] = $this->normalizeAddress($address);
+        $stream = fopen('php://temp', 'r+b');
+        stream_filter_append($stream, 'convert.base64-encode', STREAM_FILTER_WRITE);
+
+        foreach ($email->toIterable() as $chunk) {
+            fwrite($stream, $chunk);
         }
 
-        return $addressesArray;
+        fflush($stream);
+        rewind($stream);
+
+        return $stream;
     }
 
-    private function normalizeBody(Email $email): array
+    private function getAccessToken(): string
     {
-        // prefer html body
-        if (null !== $htmlContent = $email->getHtmlBody()) {
-            return [
-                'contentType' => 'html',
-                'content' => $htmlContent,
-            ];
+        $cacheKey = "{$this->graphTenantId}:{$this->graphClientId}";
+        $accessToken = self::$accessTokenCache[$cacheKey] ?? null;
+
+        if($accessToken === null) {
+            $accessToken = $this->requestAccessToken();
+            self::$accessTokenCache[$cacheKey] = $accessToken;
         }
 
-        // fallback on textBody
-        if (null !== $textContent = $email->getTextBody()) {
-            return [
-                'contentType' => 'text',
-                'content' => $textContent,
-            ];
-        }
-
-        return [];
+        return $accessToken;
     }
 
-    private function normalizeAttachments(Email $email): array
+    private function requestAccessToken(): string
     {
-        $attachments = [];
-        foreach ($email->getAttachments() as $attachment) {
-            $headers = $attachment->getPreparedHeaders();
-            $filename = $headers->getHeaderParameter('Content-Disposition', 'filename');
-
-            $normalizedAttachment = [
-                '@odata.type' => '#microsoft.graph.fileAttachment',
-                'contentType' => $headers->get('Content-Type')->getBody(),
-                'contentBytes' => base64_encode($attachment->getBody()),
-                'name' => $filename,
-            ];
-            if ($this->isInlineAttachment($attachment, $headers)) {
-                $normalizedAttachment['isInline'] = true;
-//                $normalizedAttachment['contentId'] = $attachment->getName();
-            }
-            $attachments[] = $normalizedAttachment;
-        }
-
-        return $attachments;
-    }
-
-    private function normalizeSaveToSentItems($email): bool
-    {
-        $saveToSentItems = true;
-        $saveToSentHeader = $email->getHeaders()->get('X-Save-To-Sent-Items');
-        if ($saveToSentHeader !== null) {
-            if (strtolower($saveToSentHeader->getBodyAsString()) === 'false') {
-                $saveToSentItems = false;
-            }
-        }
-
-        return $saveToSentItems;
-    }
-
-    private function isInlineAttachment(DataPart $attachment, Headers $headers): bool
-    {
-        if(method_exists($attachment, 'getDisposition')) {
-            return $attachment->getDisposition() === 'inline';
-        }
-
-        $ContentDispositionHeader = $headers->get('Content-Disposition');
-
-        if($ContentDispositionHeader instanceof ParameterizedHeader) {
-            return $ContentDispositionHeader->getValue() === 'inline';
-        }
-
-        return false;
-    }
-
-    private function requestAccessToken(): void
-    {
-        $url = 'https://login.microsoftonline.com/' . $this->graphTentantId . '/oauth2/v2.0/token';
+        $url = 'https://login.microsoftonline.com/' . $this->graphTenantId . '/oauth2/v2.0/token';
 
         $response = $this->client->request('POST', $url, [
             'body' => [
@@ -202,7 +117,7 @@ class GraphApiTransport extends AbstractApiTransport
         ]);
 
         $token = json_decode($response->getContent(), null, 512, JSON_THROW_ON_ERROR);
-        $this->accessToken = $token->access_token;
+        return $token->access_token;
     }
 
     private function getEndpoint(SentMessage $sentMessage): string
